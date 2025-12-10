@@ -7,9 +7,7 @@
 
 name: astrbot_plugin_recaptcha
 display_name: 新成员验证插件
+desc: 新成员入群验证插件，要求新成员完成recaptcha验证
 version: 1.0.0
 author: YoungUsing
-description: 新成员入群验证插件，要求新成员完成recaptcha验证
 repo_url: https://github.com/YoungUsing/astrbot_plugin_recaptcha
-requirements:
-  - aiohttp>=3.8.0
