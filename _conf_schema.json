@@ -1,0 +1,31 @@
+
+{
+  "encsec": {
+    "type": "string",
+    "description": "reCAPTCHA验证密钥",
+    "hint": "从recaptcha.uslng.eu.org获取的encsec参数值",
+    "obvious_hint": true
+  },
+  "admin_id": {
+    "type": "string",
+    "description": "超时后需要@的管理员ID",
+    "hint": "填写QQ号或其他平台ID"
+  },
+  "super_admin_ids": {
+    "type": "list",
+    "description": "超级管理员ID列表（可触发验证）",
+    "hint": "填写QQ号或其他平台ID，多个用逗号分隔",
+    "default": []
+  },
+  "timeout_minutes": {
+    "type": "int",
+    "description": "验证超时时间（分钟）",
+    "default": 5
+  },
+  "enable_help_command": {
+    "type": "bool",
+    "description": "启用帮助命令",
+    "default": true,
+    "hint": "启用后可使用/验证帮助查看所有命令"
+  }
+}
