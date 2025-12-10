@@ -28,125 +28,134 @@
 import json
 import random
 import string
+import time
 import aiohttp
-import asyncio
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api import AstrBotConfig  # 修正导入路径
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
-from astrbot.api.provider import AstrBotConfig
 from astrbot.api.message_components import Plain, At
-from astrbot.core.utils.session_waiter import SessionController, SessionWaiter
 
-@register("astrbot_plugin_recaptcha", "YoungUsing", "入群自动验证插件", "1.0.0")
+@register("group_verification", "AstrDeveloper", "入群自动验证插件", "1.0.1")
 class GroupVerification(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        # 用于存储待验证用户: {group_id-user_id: {"code": "xyz", "time": 1234567890, "origin": event_origin}}
+        self.pending_users = {}
 
-    # 生成随机验证码
     def _generate_random_code(self, length=8):
         return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
-    # 检查是否为管理员
     def _is_admin(self, user_id: str):
         # 检查 AstrBot 全局配置的管理员或插件配置的额外管理员
         is_global_admin = user_id in self.context.config.super_users
-        is_plugin_admin = user_id in self.config.get("extra_admins", [])
+        extra_admins = self.config.get("extra_admins", [])
+        is_plugin_admin = user_id in extra_admins
         return is_global_admin or is_plugin_admin
 
-    # 监听所有消息/事件，用于捕获群成员增加
-    # 注意：NapCat/OneBot 的 notice 事件在 AstrBot 中可能需要通过 raw_message 判断
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def on_group_event(self, event: AstrMessageEvent):
+    async def on_event(self, event: AstrMessageEvent):
+        # 1. 处理群成员增加事件 (通过 raw_message 判断)
         raw = event.raw_message
-        
-        # 判断是否为群成员增加事件 (OneBot v11 标准)
         if isinstance(raw, dict) and raw.get('post_type') == 'notice' and raw.get('notice_type') == 'group_increase':
-            user_id = str(raw.get('user_id'))
-            group_id = str(raw.get('group_id'))
-            
-            # 这里的 event 对象可能不包含发送消息所需的全部上下文，
-            # 因此我们需要构造一个发送目标，或者直接利用 event 对象回传（如果 AstrBot 封装允许）
-            # 为了保险，我们通过 raw 数据构建回传链
-            
-            # 生成本次验证的随机码
-            verify_code = self._generate_random_code()
-            site_url = self.config.get("site", "http://localhost")
-            
-            # 提示消息
-            msg_chain = [
-                At(qq=user_id),
-                Plain(f"\n欢迎入群！请在 5 分钟内完成人机验证。\n"),
-                Plain(f"1. 访问验证地址: {site_url}\n"),
-                Plain(f"2. 获取代码后，请在此群内直接发送该代码。\n"),
-                Plain(f"管理员可回复“强制通过”跳过验证。")
-            ]
-            
-            # 发送提示消息
-            await self.context.send_message(event.unified_msg_origin, msg_chain)
-            
-            # 启动会话控制器
-            # timeout=300秒 (5分钟)
-            controller = SessionController(timeout=300, reset_timeout=False)
-            
-            try:
-                # 使用 session_waiter 等待用户回复
-                # 我们只关心当前群、当前用户的回复，或者管理员的指令
-                async for new_event in SessionWaiter(controller):
-                    # 过滤非本群消息
-                    if str(new_event.message_obj.group_id) != group_id:
-                        continue
-                    
-                    sender_id = str(new_event.get_sender_id())
-                    text = new_event.message_str.strip()
-                    
-                    # 情况1：管理员强制通过
-                    if text == "强制通过" and self._is_admin(sender_id):
-                        yield new_event.plain_result(f"管理员 {sender_id} 已强制通过验证。")
-                        controller.stop()
-                        return
+            await self._handle_group_increase(event, raw)
+            return
 
-                    # 情况2：新成员发送了代码
-                    if sender_id == user_id:
-                        # 提交到 verify 接口
-                        verify_result = await self._check_verification(text)
-                        
-                        if verify_result.get("success"):
-                            decrypted_text = verify_result.get("decrypted", "")
-                            
-                            # 验证解密后的文本中是否包含我们的随机码
-                            if verify_code in decrypted_text:
-                                yield new_event.plain_result("验证成功！欢迎加入。")
-                                controller.stop()
-                                return
-                            else:
-                                yield new_event.plain_result("验证失败：返回代码无效，请检查后重新发送。")
-                        else:
-                            # 接口请求失败或返回 success: false
-                            yield new_event.plain_result("验证接口校验失败，请重试。")
+        # 2. 处理消息事件 (用户提交代码 或 管理员强制通过)
+        # 确保是群消息
+        if event.message_obj.group_id:
+            await self._handle_group_message(event)
+
+    async def _handle_group_increase(self, event: AstrMessageEvent, raw: dict):
+        user_id = str(raw.get('user_id'))
+        group_id = str(raw.get('group_id'))
+        key = f"{group_id}-{user_id}"
+
+        # 生成验证信息
+        verify_code = self._generate_random_code()
+        site_url = self.config.get("site", "http://localhost")
+        
+        # 记录状态
+        self.pending_users[key] = {
+            "code": verify_code,
+            "time": time.time(),
+            "origin": event.unified_msg_origin
+        }
+
+        # 发送提示
+        msg_chain = [
+            At(qq=user_id),
+            Plain(f"\n欢迎入群！请在 5 分钟内完成人机验证。\n"),
+            Plain(f"1. 访问验证地址: {site_url}\n"),
+            Plain(f"2. 获取代码后，请在此群内直接发送该代码。\n"),
+            Plain(f"管理员可回复“强制通过 @用户”跳过验证。")
+        ]
+        
+        # 注意：notice 事件可能没有标准的 message_chain 构造能力，使用 unified_msg_origin 尝试发送
+        # 如果 raw_message 中包含 sender_id 等信息，AstrBot 通常能构建出 origin
+        try:
+            await self.context.send_message(event.unified_msg_origin, msg_chain)
+        except Exception as e:
+            # 如果 notice 事件无法直接回传，尝试构建一个新的 MessageChain (视具体 Adapter 实现而定)
+            pass
+
+    async def _handle_group_message(self, event: AstrMessageEvent):
+        user_id = event.get_sender_id()
+        group_id = event.message_obj.group_id
+        text = event.message_str.strip()
+        key = f"{group_id}-{user_id}"
+
+        # --- 逻辑 A: 管理员强制通过 ---
+        if text.startswith("强制通过") and self._is_admin(user_id):
+            # 检查是否有 @用户
+            target_id = None
+            for comp in event.message_obj.message:
+                if isinstance(comp, At):
+                    target_id = str(comp.qq)
+                    break
             
-            except asyncio.TimeoutError:
-                # 超时处理
+            if target_id:
+                target_key = f"{group_id}-{target_id}"
+                if target_key in self.pending_users:
+                    del self.pending_users[target_key]
+                    yield event.plain_result(f"管理员已强制通过用户 {target_id} 的验证。")
+                else:
+                    yield event.plain_result(f"用户 {target_id} 不在等待验证列表中。")
+            return
+
+        # --- 逻辑 B: 用户提交验证码 ---
+        if key in self.pending_users:
+            user_data = self.pending_users[key]
+            
+            # 1. 检查超时
+            if time.time() - user_data["time"] > 300: # 300秒 = 5分钟
+                del self.pending_users[key]
+                # 超时通知管理员
                 admin_id = self.config.get("timeout_admin_id", "")
-                timeout_chain = [
-                    Plain(f"用户 "),
-                    At(qq=user_id),
-                    Plain(" 验证超时 (5分钟未通过)。\n"),
-                ]
+                chain = [Plain("验证超时。")]
                 if admin_id:
-                    timeout_chain.append(At(qq=admin_id))
-                    timeout_chain.append(Plain(" 请关注。"))
-                
-                await self.context.send_message(event.unified_msg_origin, timeout_chain)
+                    chain.append(At(qq=admin_id))
+                yield event.chain_result(chain)
+                return
+
+            # 2. 调用接口验证
+            verify_result = await self._check_verification(text)
+            
+            if verify_result.get("success"):
+                decrypted_text = verify_result.get("decrypted", "")
+                if user_data["code"] in decrypted_text:
+                    del self.pending_users[key]
+                    yield event.plain_result("验证成功！欢迎加入。")
+                else:
+                    yield event.plain_result("验证失败：代码无效或不匹配，请检查后重新发送。")
+            else:
+                yield event.plain_result(f"验证接口错误: {verify_result.get('error', '未知错误')}")
 
     async def _check_verification(self, user_code: str) -> dict:
-        """
-        发送 POST 请求进行验证
-        """
         base_url = self.config.get("site", "").rstrip('/')
         api_url = f"{base_url}/verify"
         encsec = self.config.get("encsec", "")
         
-        # 构造 form-data 参数
         payload = {
             "action": "decrypt",
             "encsec": encsec,
@@ -155,11 +164,9 @@ class GroupVerification(Star):
         
         try:
             async with aiohttp.ClientSession() as session:
-                # 使用 data 参数发送 application/x-www-form-urlencoded
                 async with session.post(api_url, data=payload, timeout=10) as resp:
                     if resp.status == 200:
                         try:
-                            # 解析 JSON 响应
                             return await resp.json()
                         except:
                             return {"success": False, "error": "Invalid JSON"}
@@ -168,18 +175,9 @@ class GroupVerification(Star):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    # 手动触发指令（用于测试或补救）
-    @filter.command("verify", alias=["验证"])
-    async def manual_verify(self, event: AstrMessageEvent, user_code: str):
-        '''手动提交验证代码'''
-        # 这里只做简单的提交测试，不涉及入群流程的随机码比对，
-        # 实际使用中主要依靠 group_increase 触发的自动流程。
-        # 如果需要手动验证某人，逻辑会比较复杂（需要知道当时的随机码）。
-        # 此指令主要用于测试接口连通性。
-        
-        verify_result = await self._check_verification(user_code)
-        if verify_result.get("success"):
-            decrypted = verify_result.get("decrypted", "无内容")
-            yield event.plain_result(f"接口测试通过。\n解密内容: {decrypted}")
-        else:
-            yield event.plain_result(f"接口验证失败。\n原因: {verify_result.get('error', '未知错误')}")
+    # 手动测试指令
+    @filter.command("verify_test", alias=["测试验证"])
+    async def manual_verify_test(self, event: AstrMessageEvent, code: str):
+        '''测试解密接口连通性'''
+        res = await self._check_verification(code)
+        yield event.plain_result(f"接口返回: {res}")
